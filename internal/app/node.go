@@ -4,11 +4,14 @@ import (
     "bufio"
     "context"
     "crypto/rand"
+    "encoding/binary"
     "fmt"
+    "io"
     "log"
     "os"
     "path/filepath"
     "strings"
+    "sync"
     "time"
 
     "github.com/0xh4ty/libp2p-test/internal/network"
@@ -19,6 +22,8 @@ import (
     "github.com/libp2p/go-libp2p/core/peer"
     ma "github.com/multiformats/go-multiaddr"
 )
+
+const protocolID = "/quailfs/1.0.0"
 
 func RunNode(enableRelay bool) {
     var privKey crypto.PrivKey
@@ -38,6 +43,14 @@ func RunNode(enableRelay bool) {
     if err != nil {
         panic(err)
     }
+
+    incomingDir := filepath.Join(nodeDataDir, "incoming")
+    err = os.MkdirAll(incomingDir, 0700)
+    if err != nil {
+        panic(err)
+    }
+
+    outgoingPath := filepath.Join(nodeDataDir, "outgoing.txt")
 
     keyPath := filepath.Join(nodeDataDir, "identity.key")
     keyBytes, err := os.ReadFile(keyPath)
@@ -129,10 +142,9 @@ func RunNode(enableRelay bool) {
         log.Println("  -", p)
     }
 
-    node.SetStreamHandler(
-        "/quailfs/1.0.0",
-        handleStream,
-    )
+    node.SetStreamHandler(protocolID, func(s net.Stream) {
+        handleStream(s, incomingDir)
+    })
 
     if enableRelay {
         log.Println("Relay service enabled")
@@ -157,7 +169,7 @@ func RunNode(enableRelay bool) {
 
     defer kad.Close()
 
-    go watchRoutingTable(ctx, kad)
+    go watchRoutingTable(ctx, node, kad, staticRelays, outgoingPath)
 
     select {}
 }
@@ -283,16 +295,92 @@ func startPeerWithBootstrapNodes(
     return kad, nil
 }
 
-func handleStream(s net.Stream) {
+func handleStream(s net.Stream, incomingDir string) {
     defer s.Close()
 
     log.Println("Got a new stream!")
 
-    reader := bufio.NewReader(s)
-    writer := bufio.NewWriter(s)
+    from := s.Conn().RemotePeer()
+    path, n, err := receiveFile(s, incomingDir)
+    if err != nil {
+        log.Printf("receive from %s failed: %v\n", from, err)
+        return
+    }
+    log.Printf("received %d bytes from %s -> %s\n", n, from, path)
+}
 
-    _ = reader
-    _ = writer
+func receiveFile(r io.Reader, incomingDir string) (string, int64, error) {
+    var nameLen uint32
+    if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
+        return "", 0, err
+    }
+    if nameLen == 0 || nameLen > 4096 {
+        return "", 0, fmt.Errorf("bad name length %d", nameLen)
+    }
+
+    nameBuf := make([]byte, nameLen)
+    if _, err := io.ReadFull(r, nameBuf); err != nil {
+        return "", 0, err
+    }
+    name := filepath.Base(string(nameBuf))
+
+    var size uint64
+    if err := binary.Read(r, binary.BigEndian, &size); err != nil {
+        return "", 0, err
+    }
+
+    outPath := filepath.Join(incomingDir, fmt.Sprintf("%d-%s", time.Now().UnixNano(), name))
+    f, err := os.Create(outPath)
+    if err != nil {
+        return "", 0, err
+    }
+    defer f.Close()
+
+    n, err := io.CopyN(f, r, int64(size))
+    if err != nil {
+        return "", n, err
+    }
+    return outPath, n, nil
+}
+
+func sendFile(ctx context.Context, node host.Host, target peer.ID, path string) error {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return err
+    }
+
+    sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+    defer cancel()
+
+    s, err := node.NewStream(sctx, target, protocolID)
+    if err != nil {
+        return err
+    }
+    defer s.Close()
+
+    name := filepath.Base(path)
+    if err := binary.Write(s, binary.BigEndian, uint32(len(name))); err != nil {
+        return err
+    }
+    if _, err := s.Write([]byte(name)); err != nil {
+        return err
+    }
+    if err := binary.Write(s, binary.BigEndian, uint64(len(data))); err != nil {
+        return err
+    }
+    if _, err := s.Write(data); err != nil {
+        return err
+    }
+    return s.Close()
+}
+
+func isRelay(id peer.ID, relays []peer.AddrInfo) bool {
+    for _, r := range relays {
+        if r.ID == id {
+            return true
+        }
+    }
+    return false
 }
 
 func verifyDHTDiscovery(
@@ -344,9 +432,17 @@ func verifyDHTDiscovery(
     )
 }
 
-func watchRoutingTable(ctx context.Context, kad *dht.IpfsDHT) {
+func watchRoutingTable(
+    ctx context.Context,
+    node host.Host,
+    kad *dht.IpfsDHT,
+    relays []peer.AddrInfo,
+    outgoingPath string,
+) {
     ticker := time.NewTicker(15 * time.Second)
     defer ticker.Stop()
+
+    var sent sync.Map
 
     for {
         select {
@@ -357,6 +453,30 @@ func watchRoutingTable(ctx context.Context, kad *dht.IpfsDHT) {
             log.Printf("Routing table size: %d\n", len(peers))
             for _, p := range peers {
                 log.Printf("  - %s\n", p)
+            }
+
+            for _, c := range node.Network().Conns() {
+                p := c.RemotePeer()
+                if p == node.ID() || isRelay(p, relays) {
+                    continue
+                }
+                if _, ok := sent.Load(p); ok {
+                    continue
+                }
+                if _, err := os.Stat(outgoingPath); err != nil {
+                    log.Printf("outgoing file missing: %v\n", err)
+                    continue
+                }
+                sent.Store(p, struct{}{})
+                go func(target peer.ID) {
+                    log.Printf("sending %s to %s\n", outgoingPath, target)
+                    if err := sendFile(ctx, node, target, outgoingPath); err != nil {
+                        sent.Delete(target)
+                        log.Printf("send to %s failed: %v\n", target, err)
+                        return
+                    }
+                    log.Printf("sent %s to %s via %v\n", outgoingPath, target, node.Network().ConnsToPeer(target))
+                }(p)
             }
 
             refreshErrCh := kad.RefreshRoutingTable()
