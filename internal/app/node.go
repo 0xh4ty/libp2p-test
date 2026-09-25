@@ -22,6 +22,7 @@ import (
 
 func RunNode(enableRelay bool) {
     var privKey crypto.PrivKey
+    var filePrivKey crypto.PrivKey
 
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
@@ -32,19 +33,52 @@ func RunNode(enableRelay bool) {
     }
 
     nodeDataDir := filepath.Join(homeDir, ".libp2p-test")
-    if err := os.MkdirAll(nodeDataDir, 0700); err != nil {
+
+    err = os.MkdirAll(nodeDataDir, 0700)
+    if err != nil {
         panic(err)
     }
 
-    privKey, err = loadOrCreateIdentity(filepath.Join(nodeDataDir, "identity.key"))
-    if err != nil {
+    keyPath := filepath.Join(nodeDataDir, "identity.key")
+    keyBytes, err := os.ReadFile(keyPath)
+    if err != nil && !os.IsNotExist(err) {
         panic(err)
+    }
+
+    if len(keyBytes) == 0 {
+        randomness := rand.Reader
+
+        privKey, _, err = crypto.GenerateKeyPairWithReader(
+            crypto.RSA,
+            2048,
+            randomness,
+        )
+        if err != nil {
+            panic(err)
+        }
+
+        keyBytes, err = crypto.MarshalPrivateKey(privKey)
+        if err != nil {
+            panic(err)
+        }
+
+        err = os.WriteFile(keyPath, keyBytes, 0600)
+        if err != nil {
+            panic(err)
+        }
+    } else {
+        filePrivKey, err = crypto.UnmarshalPrivateKey(keyBytes)
+        if err != nil {
+            panic(err)
+        }
+
+        privKey = filePrivKey
     }
 
     bootstrapConfigPath := filepath.Join(nodeDataDir, "bootstrap.config")
     bootstrapNodes, err := readBootstrapConfig(bootstrapConfigPath)
     if err != nil {
-        log.Printf("bootstrap config: %v", err)
+        log.Printf("%v\n", err)
     }
 
     var staticRelays []peer.AddrInfo
@@ -95,7 +129,10 @@ func RunNode(enableRelay bool) {
         log.Println("  -", p)
     }
 
-    node.SetStreamHandler("/quailfs/1.0.0", handleStream)
+    node.SetStreamHandler(
+        "/quailfs/1.0.0",
+        handleStream,
+    )
 
     if enableRelay {
         log.Println("Relay service enabled")
@@ -104,14 +141,20 @@ func RunNode(enableRelay bool) {
     }
 
     var kad *dht.IpfsDHT
+
     if len(bootstrapNodes) == 0 {
         kad, err = startPeer(node)
     } else {
-        kad, err = startPeerWithBootstrapNodes(ctx, node, bootstrapNodes)
+        kad, err = startPeerWithBootstrapNodes(
+            ctx,
+            node,
+            bootstrapNodes,
+        )
     }
     if err != nil {
         panic(err)
     }
+
     defer kad.Close()
 
     go watchRoutingTable(ctx, kad)
@@ -120,6 +163,7 @@ func RunNode(enableRelay bool) {
 }
 
 func startPeer(node host.Host) (*dht.IpfsDHT, error) {
+
     log.Println("Starting DHT...")
 
     kad, err := dht.New(
@@ -131,6 +175,7 @@ func startPeer(node host.Host) (*dht.IpfsDHT, error) {
     }
 
     log.Println("DHT started")
+
     return kad, nil
 }
 
@@ -139,6 +184,7 @@ func startPeerWithBootstrapNodes(
     node host.Host,
     bootstrapNodes []string,
 ) (*dht.IpfsDHT, error) {
+
     log.Println("Starting DHT...")
 
     kad, err := dht.New(
@@ -160,28 +206,50 @@ func startPeerWithBootstrapNodes(
 
         maddr, err := ma.NewMultiaddr(address)
         if err != nil {
-            log.Printf("Invalid bootstrap multiaddress %q: %v\n", address, err)
+            log.Printf(
+                "Invalid bootstrap multiaddress %q: %v\n",
+                address,
+                err,
+            )
             lastErr = err
             continue
         }
 
         addrInfo, err := peer.AddrInfoFromP2pAddr(maddr)
         if err != nil {
-            log.Printf("Invalid bootstrap peer address %q: %v\n", address, err)
+            log.Printf(
+                "Invalid bootstrap peer address %q: %v\n",
+                address,
+                err,
+            )
             lastErr = err
             continue
         }
 
-        connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+        connectCtx, cancel := context.WithTimeout(
+            ctx,
+            10*time.Second,
+        )
+
         err = node.Connect(connectCtx, *addrInfo)
+
         cancel()
+
         if err != nil {
-            log.Printf("Failed to connect to bootstrap node %s: %v\n", address, err)
+            log.Printf(
+                "Failed to connect to bootstrap node %s: %v\n",
+                address,
+                err,
+            )
             lastErr = err
             continue
         }
 
-        log.Printf("Connected to bootstrap peer: %s\n", addrInfo.ID)
+        log.Printf(
+            "Connected to bootstrap peer: %s\n",
+            addrInfo.ID,
+        )
+
         kad.RoutingTable().TryAddPeer(addrInfo.ID, true, false)
 
         connectedPeer = addrInfo.ID
@@ -203,7 +271,11 @@ func startPeerWithBootstrapNodes(
 
     log.Println("DHT bootstrap completed")
 
-    if err := verifyDHTDiscovery(ctx, kad, connectedPeer); err != nil {
+    if err := verifyDHTDiscovery(
+        ctx,
+        kad,
+        connectedPeer,
+    ); err != nil {
         kad.Close()
         return nil, err
     }
@@ -218,7 +290,9 @@ func handleStream(s net.Stream) {
 
     reader := bufio.NewReader(s)
     writer := bufio.NewWriter(s)
-    _, _ = reader, writer
+
+    _ = reader
+    _ = writer
 }
 
 func verifyDHTDiscovery(
@@ -226,25 +300,48 @@ func verifyDHTDiscovery(
     kad *dht.IpfsDHT,
     target peer.ID,
 ) error {
-    log.Printf("Verifying DHT discovery of peer: %s\n", target)
 
-    lookupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+    log.Printf(
+        "Verifying DHT discovery of peer: %s\n",
+        target,
+    )
+
+    lookupCtx, cancel := context.WithTimeout(
+        ctx,
+        15*time.Second,
+    )
     defer cancel()
 
-    peers, err := kad.GetClosestPeers(lookupCtx, string(target))
+    peers, err := kad.GetClosestPeers(
+        lookupCtx,
+        string(target),
+    )
     if err != nil {
-        return fmt.Errorf("DHT peer lookup failed: %w", err)
+        return fmt.Errorf(
+            "DHT peer lookup failed: %w",
+            err,
+        )
     }
 
     for _, p := range peers {
-        log.Printf("DHT discovered peer: %s\n", p)
+        log.Printf(
+            "DHT discovered peer: %s\n",
+            p,
+        )
+
         if p == target {
-            log.Printf("DHT discovery verified: %s\n", target)
+            log.Printf(
+                "DHT discovery verified: %s\n",
+                target,
+            )
             return nil
         }
     }
 
-    return fmt.Errorf("DHT lookup completed but target peer %s was not found", target)
+    return fmt.Errorf(
+        "DHT lookup completed but target peer %s was not found",
+        target,
+    )
 }
 
 func watchRoutingTable(ctx context.Context, kad *dht.IpfsDHT) {
@@ -270,25 +367,6 @@ func watchRoutingTable(ctx context.Context, kad *dht.IpfsDHT) {
             }()
         }
     }
-}
-
-func loadOrCreateIdentity(path string) (crypto.PrivKey, error) {
-    if raw, err := os.ReadFile(path); err == nil && len(raw) > 0 {
-        return crypto.UnmarshalPrivateKey(raw)
-    }
-
-    priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
-    if err != nil {
-        return nil, err
-    }
-    raw, err := crypto.MarshalPrivateKey(priv)
-    if err != nil {
-        return nil, err
-    }
-    if err := os.WriteFile(path, raw, 0600); err != nil {
-        return nil, err
-    }
-    return priv, nil
 }
 
 func readBootstrapConfig(path string) ([]string, error) {
