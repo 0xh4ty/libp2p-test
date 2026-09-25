@@ -59,7 +59,10 @@ func NewHost(
         return libp2p.New(options...)
     }
 
-    options = append(options, libp2p.AddrsFactory(publicOrCircuitAddrs))
+    options = append(options,
+        libp2p.ForceReachabilityPrivate(),
+        libp2p.AddrsFactory(publicOrCircuitAddrs),
+    )
 
     if len(staticRelays) > 0 {
         options = append(options,
