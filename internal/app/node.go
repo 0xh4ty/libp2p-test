@@ -15,6 +15,8 @@ import (
     "github.com/0xh4ty/libp2p-test/internal/network"
     "github.com/ipfs/go-cid"
     dht "github.com/libp2p/go-libp2p-kad-dht"
+    "github.com/libp2p/go-libp2p/core/connmgr"
+    "github.com/libp2p/go-libp2p/core/control"
     "github.com/libp2p/go-libp2p/core/crypto"
     "github.com/libp2p/go-libp2p/core/host"
     net "github.com/libp2p/go-libp2p/core/network"
@@ -62,7 +64,12 @@ func RunNode(enableRelay bool) {
         staticRelays = parseBootstrapPeers(bootstrapNodes)
     }
 
-    node, err := network.NewHost(privKey, enableRelay, staticRelays)
+    var gater connmgr.ConnectionGater
+    if !enableRelay {
+        gater = lanGater{}
+    }
+
+    node, err := network.NewHost(privKey, enableRelay, staticRelays, gater)
     if err != nil {
         panic(err)
     }
@@ -79,7 +86,7 @@ func RunNode(enableRelay bool) {
     if enableRelay {
         log.Println("Relay service enabled")
     } else {
-        log.Println("Relay service disabled (client + AutoRelay)")
+        log.Println("Relay service disabled (client: private + AutoRelay, LAN dials blocked)")
     }
 
     kad, err := newDHT(node, enableRelay)
@@ -348,7 +355,16 @@ func connectToPeer(
 
         if len(node.Network().ConnsToPeer(target)) == 0 {
             var addrs []ma.Multiaddr
-            addrs = append(addrs, node.Peerstore().Addrs(target)...)
+            for _, a := range node.Peerstore().Addrs(target) {
+                if _, err := a.ValueForProtocol(ma.P_CIRCUIT); err == nil {
+                    addrs = append(addrs, a)
+                    continue
+                }
+                if manet.IsIPLoopback(a) || manet.IsPrivateAddr(a) {
+                    continue
+                }
+                addrs = append(addrs, a)
+            }
             for _, r := range relays {
                 for _, ra := range usableRelayAddrs(r) {
                     circ, err := circuitAddr(ra, r.ID, target)
@@ -520,4 +536,28 @@ func circuitAddr(relayAddr ma.Multiaddr, relayID, target peer.ID) (ma.Multiaddr,
 func handleStream(s net.Stream) {
     defer s.Close()
     log.Printf("got %s from %s via %v", protocolID, s.Conn().RemotePeer(), s.Conn().RemoteMultiaddr())
+}
+
+type lanGater struct{}
+
+func (lanGater) InterceptPeerDial(peer.ID) bool { return true }
+
+func (lanGater) InterceptAddrDial(_ peer.ID, addr ma.Multiaddr) bool {
+    if _, err := addr.ValueForProtocol(ma.P_CIRCUIT); err == nil {
+        return true
+    }
+    if manet.IsIPLoopback(addr) || manet.IsPrivateAddr(addr) {
+        return false
+    }
+    return true
+}
+
+func (lanGater) InterceptAccept(net.ConnMultiaddrs) bool { return true }
+
+func (lanGater) InterceptSecured(net.Direction, peer.ID, net.ConnMultiaddrs) bool {
+    return true
+}
+
+func (lanGater) InterceptUpgraded(net.Conn) (bool, control.DisconnectReason) {
+    return true, 0
 }
