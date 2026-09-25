@@ -1,0 +1,9 @@
+# Binaries
+/libp2p-test
+/node
+
+# OS
+.DS_Store
+
+# Node data dirs if you test locally in-repo
+.node-data/
