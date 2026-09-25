@@ -9,32 +9,20 @@ import (
     "os"
     "path/filepath"
     "strings"
-    "sync"
     "time"
 
     "github.com/0xh4ty/libp2p-test/internal/network"
-    "github.com/ipfs/go-cid"
     dht "github.com/libp2p/go-libp2p-kad-dht"
-    "github.com/libp2p/go-libp2p/core/connmgr"
-    "github.com/libp2p/go-libp2p/core/control"
     "github.com/libp2p/go-libp2p/core/crypto"
     "github.com/libp2p/go-libp2p/core/host"
     net "github.com/libp2p/go-libp2p/core/network"
     "github.com/libp2p/go-libp2p/core/peer"
-    pingp2p "github.com/libp2p/go-libp2p/p2p/protocol/ping"
     ma "github.com/multiformats/go-multiaddr"
-    manet "github.com/multiformats/go-multiaddr/net"
-    mh "github.com/multiformats/go-multihash"
 )
 
-const protocolID = "/libp2p-test/1.0.0"
-
-func rendezvousCID() cid.Cid {
-    h, _ := mh.Sum([]byte("libp2p-test-rendezvous"), mh.SHA2_256, -1)
-    return cid.NewCidV1(cid.Raw, h)
-}
-
 func RunNode(enableRelay bool) {
+    var privKey crypto.PrivKey
+
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
@@ -48,142 +36,155 @@ func RunNode(enableRelay bool) {
         panic(err)
     }
 
-    privKey, err := loadOrCreateIdentity(filepath.Join(nodeDataDir, "identity.key"))
+    privKey, err = loadOrCreateIdentity(filepath.Join(nodeDataDir, "identity.key"))
     if err != nil {
         panic(err)
     }
 
-    bootstrapPath := filepath.Join(nodeDataDir, "bootstrap.config")
-    bootstrapNodes, err := readBootstrapConfig(bootstrapPath)
+    bootstrapConfigPath := filepath.Join(nodeDataDir, "bootstrap.config")
+    bootstrapNodes, err := readBootstrapConfig(bootstrapConfigPath)
     if err != nil {
         log.Printf("bootstrap config: %v", err)
     }
 
     var staticRelays []peer.AddrInfo
     if !enableRelay {
-        staticRelays = parseBootstrapPeers(bootstrapNodes)
+        for _, address := range bootstrapNodes {
+            maddr, err := ma.NewMultiaddr(address)
+            if err != nil {
+                log.Printf(
+                    "Invalid bootstrap multiaddress %q, skipping for relay use: %v\n",
+                    address,
+                    err,
+                )
+                continue
+            }
+
+            addrInfo, err := peer.AddrInfoFromP2pAddr(maddr)
+            if err != nil {
+                log.Printf(
+                    "Invalid bootstrap peer address %q, skipping for relay use: %v\n",
+                    address,
+                    err,
+                )
+                continue
+            }
+
+            staticRelays = append(staticRelays, *addrInfo)
+        }
     }
 
-    var gater connmgr.ConnectionGater
-    if !enableRelay {
-        gater = lanGater{}
-    }
-
-    node, err := network.NewHost(privKey, enableRelay, staticRelays, gater)
+    node, err := network.NewHost(privKey, enableRelay, staticRelays)
     if err != nil {
         panic(err)
     }
     defer node.Close()
 
     fmt.Println("PeerID:", node.ID())
+
     log.Println("This node's multiaddresses:")
     for _, la := range node.Addrs() {
-        log.Printf(" - %s/p2p/%s", la, node.ID())
+        log.Printf(" - %v\n", la)
+    }
+    log.Println()
+
+    time.Sleep(3 * time.Second)
+
+    log.Println("protocols after delay:")
+    for _, p := range node.Mux().Protocols() {
+        log.Println("  -", p)
     }
 
-    node.SetStreamHandler(protocolID, handleStream)
+    node.SetStreamHandler("/quailfs/1.0.0", handleStream)
 
     if enableRelay {
         log.Println("Relay service enabled")
     } else {
-        log.Println("Relay service disabled (client: private + AutoRelay, LAN dials blocked)")
+        log.Println("Relay service disabled")
     }
 
-    kad, err := newDHT(node, enableRelay)
+    var kad *dht.IpfsDHT
+    if len(bootstrapNodes) == 0 {
+        kad, err = startPeer(node)
+    } else {
+        kad, err = startPeerWithBootstrapNodes(ctx, node, bootstrapNodes)
+    }
     if err != nil {
         panic(err)
     }
     defer kad.Close()
 
-    node.Network().Notify(&net.NotifyBundle{
-        ConnectedF: func(_ net.Network, c net.Conn) {
-            pid := c.RemotePeer()
-            if pid == node.ID() {
-                return
-            }
-            _, _ = kad.RoutingTable().TryAddPeer(pid, true, false)
-            log.Printf("connected %s via %s", pid, c.RemoteMultiaddr())
-        },
-        DisconnectedF: func(_ net.Network, c net.Conn) {
-            log.Printf("disconnected %s via %s", c.RemotePeer(), c.RemoteMultiaddr())
-        },
-    })
-
-    if err := connectBootstrap(ctx, node, kad, bootstrapNodes); err != nil {
-        if enableRelay {
-            log.Printf("relay has no bootstrap peers (ok): %v", err)
-        } else {
-            panic(err)
-        }
-    }
-
-    if !enableRelay {
-        seen := make(map[peer.ID]struct{})
-        for _, r := range staticRelays {
-            if _, ok := seen[r.ID]; ok {
-                continue
-            }
-            seen[r.ID] = struct{}{}
-            go keepAlive(ctx, node, r.ID)
-        }
-    }
-
-    go watchAndDial(ctx, node, kad, staticRelays, enableRelay)
-    go announceAndDiscover(ctx, node, kad, staticRelays, enableRelay)
+    go watchRoutingTable(ctx, kad)
 
     select {}
 }
 
-func newDHT(node host.Host, enableRelay bool) (*dht.IpfsDHT, error) {
+func startPeer(node host.Host) (*dht.IpfsDHT, error) {
     log.Println("Starting DHT...")
-    mode := dht.ModeClient
-    if enableRelay {
-        mode = dht.ModeServer
-    }
+
     kad, err := dht.New(
         node,
-        dht.Mode(mode),
-        dht.RoutingTableRefreshQueryTimeout(30*time.Second),
+        dht.Mode(dht.ModeServer),
     )
     if err != nil {
         return nil, err
     }
+
     log.Println("DHT started")
     return kad, nil
 }
 
-func connectBootstrap(ctx context.Context, node host.Host, kad *dht.IpfsDHT, bootstrapNodes []string) error {
-    if len(bootstrapNodes) == 0 {
-        return fmt.Errorf("no bootstrap peers")
+func startPeerWithBootstrapNodes(
+    ctx context.Context,
+    node host.Host,
+    bootstrapNodes []string,
+) (*dht.IpfsDHT, error) {
+    log.Println("Starting DHT...")
+
+    kad, err := dht.New(
+        node,
+        dht.Mode(dht.ModeServer),
+    )
+    if err != nil {
+        return nil, err
     }
 
+    log.Println("DHT started")
+
     var lastErr error
+    var connectedPeer peer.ID
     connectedAny := false
-    seen := make(map[peer.ID]struct{})
 
     for _, address := range bootstrapNodes {
-        log.Printf("Connecting to bootstrap node: %s", address)
-        info, err := parseAddrInfo(address)
+        log.Printf("Connecting to bootstrap node: %s\n", address)
+
+        maddr, err := ma.NewMultiaddr(address)
         if err != nil {
-            log.Printf("Invalid bootstrap address %q: %v", address, err)
+            log.Printf("Invalid bootstrap multiaddress %q: %v\n", address, err)
             lastErr = err
             continue
         }
-        if _, ok := seen[info.ID]; ok {
+
+        addrInfo, err := peer.AddrInfoFromP2pAddr(maddr)
+        if err != nil {
+            log.Printf("Invalid bootstrap peer address %q: %v\n", address, err)
+            lastErr = err
             continue
         }
-        seen[info.ID] = struct{}{}
 
-        connectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-        err = node.Connect(connectCtx, *info)
+        connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+        err = node.Connect(connectCtx, *addrInfo)
         cancel()
         if err != nil {
-            log.Printf("Failed to connect to bootstrap node %s: %v", address, err)
+            log.Printf("Failed to connect to bootstrap node %s: %v\n", address, err)
             lastErr = err
             continue
         }
-        log.Printf("Connected to bootstrap peer: %s", info.ID)
-        _, _ = kad.RoutingTable().TryAddPeer(info.ID, true, false)
+
+        log.Printf("Connected to bootstrap peer: %s\n", addrInfo.ID)
+        kad.RoutingTable().TryAddPeer(addrInfo.ID, true, false)
+
+        connectedPeer = addrInfo.ID
         connectedAny = true
     }
 
@@ -191,76 +192,62 @@ func connectBootstrap(ctx context.Context, node host.Host, kad *dht.IpfsDHT, boo
         if lastErr == nil {
             lastErr = fmt.Errorf("no valid bootstrap nodes")
         }
-        return lastErr
+        kad.Close()
+        return nil, lastErr
     }
 
     if err := kad.Bootstrap(ctx); err != nil {
-        return err
+        kad.Close()
+        return nil, err
     }
+
     log.Println("DHT bootstrap completed")
-    return nil
+
+    if err := verifyDHTDiscovery(ctx, kad, connectedPeer); err != nil {
+        kad.Close()
+        return nil, err
+    }
+
+    return kad, nil
 }
 
-func announceAndDiscover(
-    ctx context.Context,
-    node host.Host,
-    kad *dht.IpfsDHT,
-    relays []peer.AddrInfo,
-    enableRelay bool,
-) {
-    key := rendezvousCID()
-    ticker := time.NewTicker(15 * time.Second)
-    defer ticker.Stop()
+func handleStream(s net.Stream) {
+    defer s.Close()
 
-    announce := func() {
-        if enableRelay && len(kad.RoutingTable().ListPeers()) == 0 {
-            return
-        }
-        pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-        defer cancel()
-        if err := kad.Provide(pctx, key, true); err != nil {
-            log.Printf("provide rendezvous: %v", err)
-        }
-    }
+    log.Println("Got a new stream!")
 
-    discover := func() {
-        pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-        defer cancel()
-        providers, err := kad.FindProviders(pctx, key)
-        if err != nil {
-            log.Printf("find providers: %v", err)
-            return
-        }
-        for _, info := range providers {
-            if info.ID == node.ID() || isRelay(info.ID, relays) {
-                continue
-            }
-            go connectToPeer(ctx, node, kad, relays, info.ID)
-        }
-    }
-
-    time.Sleep(3 * time.Second)
-    announce()
-    discover()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            announce()
-            discover()
-        }
-    }
+    reader := bufio.NewReader(s)
+    writer := bufio.NewWriter(s)
+    _, _ = reader, writer
 }
 
-func watchAndDial(
+func verifyDHTDiscovery(
     ctx context.Context,
-    node host.Host,
     kad *dht.IpfsDHT,
-    relays []peer.AddrInfo,
-    enableRelay bool,
-) {
+    target peer.ID,
+) error {
+    log.Printf("Verifying DHT discovery of peer: %s\n", target)
+
+    lookupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+    defer cancel()
+
+    peers, err := kad.GetClosestPeers(lookupCtx, string(target))
+    if err != nil {
+        return fmt.Errorf("DHT peer lookup failed: %w", err)
+    }
+
+    for _, p := range peers {
+        log.Printf("DHT discovered peer: %s\n", p)
+        if p == target {
+            log.Printf("DHT discovery verified: %s\n", target)
+            return nil
+        }
+    }
+
+    return fmt.Errorf("DHT lookup completed but target peer %s was not found", target)
+}
+
+func watchRoutingTable(ctx context.Context, kad *dht.IpfsDHT) {
     ticker := time.NewTicker(15 * time.Second)
     defer ticker.Stop()
 
@@ -269,150 +256,28 @@ func watchAndDial(
         case <-ctx.Done():
             return
         case <-ticker.C:
-            tablePeers := kad.RoutingTable().ListPeers()
-            log.Printf("Routing table size: %d", len(tablePeers))
-            for _, p := range tablePeers {
-                log.Printf("  - %s", p)
+            peers := kad.RoutingTable().ListPeers()
+            log.Printf("Routing table size: %d\n", len(peers))
+            for _, p := range peers {
+                log.Printf("  - %s\n", p)
             }
 
-            conns := node.Network().Conns()
-            log.Printf("Live connections: %d", len(conns))
-            seenConn := make(map[peer.ID]struct{})
-            for _, c := range conns {
-                p := c.RemotePeer()
-                if _, ok := seenConn[p]; !ok {
-                    log.Printf("  live %s via %v", p, c.RemoteMultiaddr())
-                    seenConn[p] = struct{}{}
-                }
-            }
-
-            allKnown := node.Peerstore().PeersWithAddrs()
-            log.Printf("Peerstore knows %d peer(s) with addresses", len(allKnown))
-            for _, p := range allKnown {
-                if p == node.ID() {
-                    continue
-                }
-                log.Printf("  peer %s addrs: %v", p, node.Peerstore().Addrs(p))
-                pcs := node.Network().ConnsToPeer(p)
-                if len(pcs) == 0 {
-                    log.Printf("    no active connection")
-                    if !isRelay(p, relays) {
-                        go connectToPeer(ctx, node, kad, relays, p)
-                    }
-                    continue
-                }
-                for _, c := range pcs {
-                    log.Printf("    active conn via: %v", c.RemoteMultiaddr())
-                }
-            }
-
-            if enableRelay && len(tablePeers) == 0 {
-                continue
-            }
             refreshErrCh := kad.RefreshRoutingTable()
             go func() {
                 if err := <-refreshErrCh; err != nil {
-                    log.Printf("Routing table refresh error: %v", err)
+                    log.Printf("Routing table refresh error: %v\n", err)
                 }
             }()
         }
     }
 }
 
-var dialing sync.Map
-
-func connectToPeer(
-    ctx context.Context,
-    node host.Host,
-    kad *dht.IpfsDHT,
-    relays []peer.AddrInfo,
-    target peer.ID,
-) {
-    if target == node.ID() || isRelay(target, relays) {
-        return
-    }
-    if _, loaded := dialing.LoadOrStore(target, struct{}{}); loaded {
-        return
-    }
-    defer dialing.Delete(target)
-
-    if len(node.Network().ConnsToPeer(target)) == 0 {
-        fctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-        info, err := kad.FindPeer(fctx, target)
-        cancel()
-        if err != nil {
-            log.Printf("find peer %s: %v", target, err)
-        } else if len(info.Addrs) > 0 {
-            cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-            err = node.Connect(cctx, info)
-            cancel()
-            if err != nil {
-                log.Printf("FindPeer connect to %s failed: %v", target, err)
-            } else {
-                log.Printf("connected to %s via FindPeer addrs %v", target, info.Addrs)
-            }
-        }
-
-        if len(node.Network().ConnsToPeer(target)) == 0 {
-            var addrs []ma.Multiaddr
-            for _, a := range node.Peerstore().Addrs(target) {
-                if _, err := a.ValueForProtocol(ma.P_CIRCUIT); err == nil {
-                    addrs = append(addrs, a)
-                    continue
-                }
-                if manet.IsIPLoopback(a) || manet.IsPrivateAddr(a) {
-                    continue
-                }
-                addrs = append(addrs, a)
-            }
-            for _, r := range relays {
-                for _, ra := range usableRelayAddrs(r) {
-                    circ, err := circuitAddr(ra, r.ID, target)
-                    if err != nil {
-                        continue
-                    }
-                    addrs = append(addrs, circ)
-                }
-            }
-            if len(addrs) == 0 {
-                return
-            }
-            cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-            err := node.Connect(cctx, peer.AddrInfo{ID: target, Addrs: addrs})
-            cancel()
-            if err != nil {
-                log.Printf("circuit/addr connect to %s failed: %v", target, err)
-                return
-            }
-            log.Printf("connected to %s", target)
-        }
-    }
-
-    if len(node.Network().ConnsToPeer(target)) == 0 {
-        return
-    }
-
-    _, _ = kad.RoutingTable().TryAddPeer(target, true, false)
-    openTestStream(ctx, node, target)
-}
-
-func openTestStream(ctx context.Context, node host.Host, target peer.ID) {
-    sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-    defer cancel()
-    s, err := node.NewStream(sctx, target, protocolID)
-    if err != nil {
-        log.Printf("stream to %s failed: %v", target, err)
-        return
-    }
-    defer s.Close()
-    log.Printf("stream ok to %s via %v", target, s.Conn().RemoteMultiaddr())
-}
-
 func loadOrCreateIdentity(path string) (crypto.PrivKey, error) {
     if raw, err := os.ReadFile(path); err == nil && len(raw) > 0 {
         return crypto.UnmarshalPrivateKey(raw)
     }
-    priv, _, err := crypto.GenerateKeyPairWithReader(crypto.Ed25519, -1, rand.Reader)
+
+    priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
     if err != nil {
         return nil, err
     }
@@ -446,118 +311,4 @@ func readBootstrapConfig(path string) ([]string, error) {
         out = append(out, line)
     }
     return out, sc.Err()
-}
-
-func parseBootstrapPeers(addrs []string) []peer.AddrInfo {
-    var out []peer.AddrInfo
-    for _, address := range addrs {
-        info, err := parseAddrInfo(address)
-        if err != nil {
-            log.Printf("skip bootstrap %q: %v", address, err)
-            continue
-        }
-        out = append(out, *info)
-    }
-    return out
-}
-
-func parseAddrInfo(address string) (*peer.AddrInfo, error) {
-    info, err := peer.AddrInfoFromString(address)
-    if err != nil {
-        return nil, err
-    }
-    return info, nil
-}
-
-func keepAlive(ctx context.Context, node host.Host, target peer.ID) {
-    _ = pingp2p.NewPingService(node)
-    ticker := time.NewTicker(30 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            if len(node.Network().ConnsToPeer(target)) == 0 {
-                continue
-            }
-            pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-            res := <-pingp2p.Ping(pctx, node, target)
-            cancel()
-            if res.Error != nil {
-                log.Printf("keepalive ping to %s failed: %v", target, res.Error)
-            } else {
-                log.Printf("keepalive ping to %s rtt=%s", target, res.RTT)
-            }
-        }
-    }
-}
-
-func isRelay(id peer.ID, relays []peer.AddrInfo) bool {
-    for _, r := range relays {
-        if r.ID == id {
-            return true
-        }
-    }
-    return false
-}
-
-func usableRelayAddrs(r peer.AddrInfo) []ma.Multiaddr {
-    var out []ma.Multiaddr
-    for _, a := range r.Addrs {
-        if manet.IsPrivateAddr(a) || manet.IsIPLoopback(a) {
-            continue
-        }
-        if _, err := a.ValueForProtocol(ma.P_CIRCUIT); err == nil {
-            continue
-        }
-        out = append(out, a)
-    }
-    return out
-}
-
-func circuitAddr(relayAddr ma.Multiaddr, relayID, target peer.ID) (ma.Multiaddr, error) {
-    base := relayAddr
-    if _, err := base.ValueForProtocol(ma.P_P2P); err != nil {
-        p, err := ma.NewMultiaddr("/p2p/" + relayID.String())
-        if err != nil {
-            return nil, err
-        }
-        base = base.Encapsulate(p)
-    }
-    circ, err := ma.NewMultiaddr("/p2p-circuit/p2p/" + target.String())
-    if err != nil {
-        return nil, err
-    }
-    return base.Encapsulate(circ), nil
-}
-
-func handleStream(s net.Stream) {
-    defer s.Close()
-    log.Printf("got %s from %s via %v", protocolID, s.Conn().RemotePeer(), s.Conn().RemoteMultiaddr())
-}
-
-type lanGater struct{}
-
-func (lanGater) InterceptPeerDial(peer.ID) bool { return true }
-
-func (lanGater) InterceptAddrDial(_ peer.ID, addr ma.Multiaddr) bool {
-    if _, err := addr.ValueForProtocol(ma.P_CIRCUIT); err == nil {
-        return true
-    }
-    if manet.IsIPLoopback(addr) || manet.IsPrivateAddr(addr) {
-        return false
-    }
-    return true
-}
-
-func (lanGater) InterceptAccept(net.ConnMultiaddrs) bool { return true }
-
-func (lanGater) InterceptSecured(net.Direction, peer.ID, net.ConnMultiaddrs) bool {
-    return true
-}
-
-func (lanGater) InterceptUpgraded(net.Conn) (bool, control.DisconnectReason) {
-    return true, 0
 }
